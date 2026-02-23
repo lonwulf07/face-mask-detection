@@ -1,12 +1,15 @@
 import streamlit as st
-import tensorflow as tf
-import numpy as np
 import cv2
-from PIL import Image
+import numpy as np
+import os
+import av
+import threading
+from tensorflow.keras.models import load_model
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 
-# --------------------------
-# Page Config
-# --------------------------
+# ============================================
+# PAGE CONFIG
+# ============================================
 
 st.set_page_config(
     page_title="Face Mask Detection",
@@ -14,78 +17,191 @@ st.set_page_config(
     layout="centered"
 )
 
-st.title("😷 Face Mask Detection App")
+st.title("😷 Face Mask Detection System")
 
-st.write("Upload an image to detect whether the person is wearing a mask or not.")
 
-# --------------------------
-# Load Model
-# --------------------------
+# ============================================
+# LOAD MODEL
+# ============================================
 
-@st.cache_resource
-def load_model():
-    model = tf.keras.models.load_model("../models/mask_detector.h5")
-    return model
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "..", "models", "mask_detector.keras")
 
-model = load_model()
+model = load_model(MODEL_PATH, compile=False)
 
-# --------------------------
-# Upload Image
-# --------------------------
+labels = ["Without Mask", "With Mask"]
 
-uploaded_file = st.file_uploader(
-    "Upload Image",
-    type=["jpg", "jpeg", "png"]
+
+# ============================================
+# PREDICTION FUNCTION
+# ============================================
+
+def predict_image(image):
+
+    img = cv2.resize(image, (224, 224))
+
+    img = img / 255.0
+
+    img = np.reshape(img, (1, 224, 224, 3))
+
+    prediction = model.predict(img, verbose=0)
+
+    confidence = float(np.max(prediction))
+
+    label = labels[np.argmax(prediction)]
+
+    return label, confidence
+
+
+# ============================================
+# SIDEBAR
+# ============================================
+
+option = st.sidebar.selectbox(
+
+    "Select Detection Mode",
+
+    (
+
+        "Image Upload",
+
+        "Real-Time Webcam"
+
+    )
+
 )
 
-# --------------------------
-# Prediction Function
-# --------------------------
 
-def predict(image):
+# ============================================
+# IMAGE UPLOAD MODE
+# ============================================
 
-    image = image.convert("RGB")
+if option == "Image Upload":
 
-    image = image.resize((224, 224))
+    st.header("Upload Image")
 
-    image = np.array(image)
+    uploaded_file = st.file_uploader(
 
-    image = image / 255.0
+        "Choose an image",
 
-    image = np.expand_dims(image, axis=0)
+        type=["jpg", "jpeg", "png"]
 
-    prediction = model.predict(image)
+    )
 
-    return prediction
+    if uploaded_file is not None:
+
+        file_bytes = np.asarray(
+
+            bytearray(uploaded_file.read()),
+
+            dtype=np.uint8
+
+        )
+
+        image = cv2.imdecode(file_bytes, 1)
+
+        if image is not None:
+
+            label, confidence = predict_image(image)
+
+            color = (0,255,0) if label=="With Mask" else (0,0,255)
+
+            output = image.copy()
+
+        cv2.putText(
+
+            output,
+
+            f"{label}: {confidence*100:.2f}%",
+
+            (20,40),
+
+            cv2.FONT_HERSHEY_SIMPLEX,
+
+            1,
+
+            color,
+
+            2
+
+        )
+
+        st.image(output, channels="BGR")
+
+        st.success(f"Prediction: {label}")
+
+        st.info(f"Confidence: {confidence*100:.2f}%")
 
 
-# --------------------------
-# Show Result
-# --------------------------
+# ============================================
+# REALTIME MODE
+# ============================================
 
-if uploaded_file is not None:
+elif option == "Real-Time Webcam":
 
-    image = Image.open(uploaded_file)
+    st.header("Real-Time Webcam Detection")
+    
+    # RTC Configuration (IMPORTANT — prevents crashes)
+    RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    )
 
-    st.image(image, caption="Uploaded Image", width="stretch")
 
-    st.write("")
+    # Thread lock for safe prediction
+    lock = threading.Lock()
 
-    st.write("Predicting...")
 
-    prediction = predict(image)
+    class VideoProcessor(VideoProcessorBase):
 
-    confidence = float(prediction[0][0])
+        def recv(self, frame):
 
-    if confidence > 0.5:
+            img = frame.to_ndarray(format="bgr24")
 
-        result = "Without Mask"
+            # Resize smaller for performance
+            resized = cv2.resize(img, (224, 224))
 
-    else:
+            resized = resized / 255.0
+            reshaped = np.reshape(resized, (1, 224, 224, 3))
 
-        result = "With Mask"
-        confidence = 1 - confidence
+            with lock:
 
-    st.success(f"Prediction: {result}")
+                prediction = model.predict(reshaped, verbose=0)
 
-    st.info(f"Confidence: {confidence*100:.2f}%")
+            confidence = float(np.max(prediction))
+
+            label = labels[np.argmax(prediction)]
+
+            color = (0,255,0) if label=="With Mask" else (0,0,255)
+
+            cv2.putText(
+
+                img,
+
+                f"{label}: {confidence*100:.2f}%",
+
+                (20,40),
+
+                cv2.FONT_HERSHEY_SIMPLEX,
+
+                1,
+
+                color,
+
+                2
+
+            )
+
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+
+    webrtc_streamer(
+
+        key="realtime",
+
+        rtc_configuration=RTC_CONFIGURATION,
+
+        video_processor_factory=VideoProcessor,
+
+        async_processing=True,
+
+    )
